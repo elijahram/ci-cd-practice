@@ -27,13 +27,14 @@ jobs:
     permissions:
       contents: read
       statuses: read
+      deployments: read # look up the current Development URL
     outputs:
       sha: ${{ steps.release.outputs.sha }}
       run-id: ${{ steps.release.outputs.run-id }}
       fingerprint: ${{ steps.release.outputs.fingerprint }}
     env:
       GH_TOKEN: ${{ github.token }}
-      DEV_URL: ${{ vars.DEV_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
+      DEV_URL_OVERRIDE: ${{ vars.DEV_URL }}
     steps:
       - name: Check confirmation
         run: |
@@ -45,10 +46,16 @@ jobs:
       - name: Checkout repository (for helper scripts)
         uses: actions/checkout@v7
 
-      # 1. Identify the current Development release by asking the live site.
+      # 1. Identify the current Development release: find the Development URL
+      #    from GitHub's deployment history, then ask the live site which
+      #    release it is serving.
       - name: Identify the release currently in Development
         id: release
         run: |
+          DEV_URL="${DEV_URL_OVERRIDE:-$(scripts/environment-url.sh development)}"
+          DEV_URL="${DEV_URL%/}/"
+          echo "DEV_URL=$DEV_URL" >> "$GITHUB_ENV"
+          echo "Development URL: $DEV_URL"
           json=$(curl -sSf "${DEV_URL}release.json?nocache=$(date +%s%N)")
           echo "$json" | jq .
           {
@@ -88,10 +95,9 @@ jobs:
     permissions:
       contents: read
       actions: read
-      pages: write
-      id-token: write
       statuses: write
     uses: ./.github/workflows/deploy-production.yml
+    secrets: inherit
     with:
       artifact-run-id: ${{ needs.identify.outputs.run-id }}
       release-sha: ${{ needs.identify.outputs.sha }}

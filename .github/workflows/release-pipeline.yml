@@ -46,13 +46,12 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
 
   # ---------------------------------------------------------------------------
-  # PHASE 4 — Deploy the artifact to the Development GitHub Pages site.
+  # PHASE 4 — Deploy the artifact to the Development site on Vercel.
   #
-  # The Development site lives in a SECOND repository (cicd-demo-dev) because
-  # one GitHub repository can only host one GitHub Pages site. The built-in
-  # GITHUB_TOKEN can only write to THIS repository, so pushing to the other
-  # repository requires a fine-grained Personal Access Token stored as the
-  # DEV_PAGES_DEPLOY_TOKEN secret in the "development" environment.
+  # Development and Production are two separate Vercel projects
+  # (cicd-demo-dev and cicd-demo). Each GitHub Environment stores WHICH Vercel
+  # project it deploys to (the VERCEL_PROJECT_ID variable), so the exact same
+  # deploy script sends the exact same files to a different place.
   # ---------------------------------------------------------------------------
   deploy-development:
     name: Deploy Development
@@ -65,28 +64,23 @@ jobs:
     # workflow graph.
     environment:
       name: development
-      url: ${{ steps.target.outputs.url }}
-    # Never let two runs push to the Development site at the same time.
+      url: ${{ steps.deploy.outputs.url }}
+    # Never let two runs deploy to Development at the same time.
     concurrency:
       group: deploy-development
       cancel-in-progress: false
     outputs:
-      url: ${{ steps.target.outputs.url }}
+      url: ${{ steps.deploy.outputs.url }}
     steps:
       - name: Checkout repository (for helper scripts)
         uses: actions/checkout@v7
 
-      # Environment variables (Settings → Environments → development) can
-      # override these. Defaults follow the naming used in the README.
-      - name: Resolve Development target
-        id: target
-        env:
-          APP_URL: ${{ vars.APP_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
-          PAGES_REPO: ${{ vars.PAGES_REPO || format('{0}/cicd-demo-dev', github.repository_owner) }}
-        run: |
-          echo "url=${APP_URL%/}/" >> "$GITHUB_OUTPUT"
-          echo "repo=$PAGES_REPO" >> "$GITHUB_OUTPUT"
-          echo "Deploying to repo $PAGES_REPO -> ${APP_URL%/}/"
+      # Node is needed to run the Vercel CLI (via npx). No npm ci: we are not
+      # building anything here.
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
 
       # Retrieve the SAME artifact that was built and E2E-tested above.
       - name: Download the build artifact
@@ -103,32 +97,26 @@ jobs:
           echo "actual:   $actual"
           test "$actual" = "$expected"
 
-      # Publish = force-push the artifact's files to the gh-pages branch of the
-      # cicd-demo-dev repository. GitHub Pages then serves that branch.
-      # The token is passed through an env var (never printed; GitHub also
-      # masks secrets in logs automatically).
-      - name: Publish to the Development GitHub Pages repository
+      # Upload the prebuilt files to the Development Vercel project.
+      # Secrets are passed through env vars (never on the command line), and
+      # GitHub automatically masks them in logs.
+      - name: Deploy artifact to Vercel (Development project)
+        id: deploy
         env:
-          DEPLOY_TOKEN: ${{ secrets.DEV_PAGES_DEPLOY_TOKEN }}
-          PAGES_REPO: ${{ steps.target.outputs.repo }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          APP_URL: ${{ vars.APP_URL }}
         run: |
-          if [ -z "$DEPLOY_TOKEN" ]; then
-            echo "::error title=Missing secret::DEV_PAGES_DEPLOY_TOKEN is not set in the 'development' environment. See README → Setup → step 6."
-            exit 1
-          fi
-          cd site
-          git init -q -b gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -q -m "Deploy ${GITHUB_SHA::7} from ${GITHUB_REPOSITORY} run #${GITHUB_RUN_NUMBER}"
-          git push --force -q "https://x-access-token:${DEPLOY_TOKEN}@github.com/${PAGES_REPO}.git" gh-pages
-          echo "Pushed build to ${PAGES_REPO}@gh-pages"
+          url=$(scripts/deploy-vercel.sh site | tail -n 1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "## 🟡 Deployed to Development: $url" >> "$GITHUB_STEP_SUMMARY"
 
-      # GitHub Pages needs ~30-90s to publish. Wait until the live site reports
-      # THIS commit in /release.json before we test it.
+      # Wait until the live site reports THIS commit in /release.json before
+      # we test it (the domain switch is usually instant on Vercel, but we
+      # verify instead of assuming).
       - name: Wait for Development to serve this release
-        run: scripts/wait-for-release.sh "${{ steps.target.outputs.url }}" "$GITHUB_SHA" 600
+        run: scripts/wait-for-release.sh "${{ steps.deploy.outputs.url }}" "$GITHUB_SHA" 300
 
   # ---------------------------------------------------------------------------
   # PHASE 4 (cont.) — Test the REAL deployed Development site.
@@ -304,10 +292,11 @@ jobs:
     permissions:
       contents: read
       actions: read # download the artifact
-      pages: write # deploy to GitHub Pages
-      id-token: write # prove to GitHub Pages that this deployment came from this workflow
       statuses: write # update the release-control status
     uses: ./.github/workflows/deploy-production.yml
+    # Lets the called workflow use VERCEL_TOKEN if you stored it as a
+    # repository secret. (Environment secrets work without this.)
+    secrets: inherit
     with:
       artifact-run-id: ${{ github.run_id }}
       release-sha: ${{ github.sha }}

@@ -12,7 +12,7 @@ export default function App() {
   const [text, setText] = useState('');
   const nextId = useRef(1);
 
-  const environment = getEnvironment(window.location.pathname);
+  const environment = getEnvironment(window.location.hostname);
   const build = getBuildInfo();
   const remaining = todos.filter((todo) => !todo.completed).length;
 

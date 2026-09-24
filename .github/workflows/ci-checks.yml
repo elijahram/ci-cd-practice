@@ -168,13 +168,12 @@ jobs:
           cat dist/release.json
 
       # Store dist/ as a versioned GitHub Actions artifact. You can download it
-      # from the run's Summary page. include-hidden-files keeps .nojekyll.
+      # from the run's Summary page.
       - name: Create Build Artifact (react-build-artifact)
         uses: actions/upload-artifact@v7
         with:
           name: react-build-artifact
           path: dist/
-          include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
 

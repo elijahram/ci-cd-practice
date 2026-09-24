@@ -8,7 +8,7 @@
 # Either way it:
 #   1. downloads the SAME react-build-artifact that went to Development
 #   2. verifies its fingerprint (proves it is byte-for-byte identical)
-#   3. deploys it to GitHub Pages (NO rebuild)
+#   3. deploys it to the Production Vercel project (NO rebuild)
 #   4. waits until Production serves it
 #   5. runs an HTTP health check
 #   6. runs a small Playwright smoke test
@@ -44,18 +44,16 @@ jobs:
     permissions:
       contents: read
       actions: read # needed to download an artifact from another run
-      pages: write
-      id-token: write
       statuses: write
     environment:
       name: production
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy.outputs.url }}
     # Only one production deployment at a time, and never cancel one halfway.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
     outputs:
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy.outputs.url }}
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_SHA: ${{ inputs.release-sha }}
@@ -105,18 +103,24 @@ jobs:
           echo "actual:   $actual"
           test "$actual" = "${{ inputs.expected-fingerprint }}"
 
-      # GitHub Pages' official deploy action wants the files wrapped in its own
-      # artifact format (a tarball named "github-pages"). This only RE-PACKAGES
-      # the identical files; nothing is rebuilt.
-      - name: Package artifact for GitHub Pages
-        uses: actions/upload-pages-artifact@v5
+      - name: Set up Node
+        uses: actions/setup-node@v7
         with:
-          path: site/
-          include-hidden-files: true
+          node-version-file: .nvmrc
 
-      - name: Deploy to GitHub Pages (Production)
+      # Same script as Development. The only difference is the production
+      # environment's VERCEL_PROJECT_ID, which points at the cicd-demo project.
+      - name: Deploy artifact to Vercel (Production project)
         id: deploy
-        uses: actions/deploy-pages@v5
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          url=$(scripts/deploy-vercel.sh site | tail -n 1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "## 🟢 Deployed to Production: $url" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record failed deployment
         if: failure()
@@ -142,7 +146,7 @@ jobs:
         uses: ./.github/actions/setup-project
 
       - name: Wait for Production to serve this release
-        run: scripts/wait-for-release.sh "$PROD_URL" "$RELEASE_SHA" 600
+        run: scripts/wait-for-release.sh "$PROD_URL" "$RELEASE_SHA" 300
 
       - name: Health check (expect HTTP 200)
         run: scripts/health-check.sh "$PROD_URL"
@@ -181,7 +185,8 @@ jobs:
           {
             echo "## ❌ Production smoke test FAILED"
             echo "The release is deployed but did not pass its smoke test."
-            echo "To roll back: revert the bad commit on main (a new PR) or re-run the Deploy job of the last good release."
+            echo "To roll back: in the Vercel dashboard open the cicd-demo project → Deployments → previous deployment → **Instant Rollback**,"
+            echo "or re-run the Production jobs of the last good release, then fix the bug in a new PR."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Playwright report

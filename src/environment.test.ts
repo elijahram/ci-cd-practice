@@ -2,16 +2,18 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getBuildInfo, getEnvironment } from './environment';
 
 describe('getEnvironment', () => {
-  it('detects Development from the dev GitHub Pages path', () => {
-    expect(getEnvironment('/cicd-demo-dev/')).toBe('Development');
+  it('detects Development from the dev Vercel domain', () => {
+    expect(getEnvironment('cicd-demo-dev.vercel.app')).toBe('Development');
+    expect(getEnvironment('cicd-demo-dev-elijahram.vercel.app')).toBe('Development');
   });
 
-  it('detects Production from the prod GitHub Pages path', () => {
-    expect(getEnvironment('/cicd-demo/')).toBe('Production');
+  it('detects Production from the prod Vercel domain', () => {
+    expect(getEnvironment('cicd-demo.vercel.app')).toBe('Production');
+    expect(getEnvironment('cicd-demo-elijahram.vercel.app')).toBe('Production');
   });
 
   it('falls back to Local for anything else', () => {
-    expect(getEnvironment('/')).toBe('Local');
+    expect(getEnvironment('localhost')).toBe('Local');
   });
 });
 

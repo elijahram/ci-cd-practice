@@ -6,10 +6,9 @@ export default defineConfig({
   plugins: [react()],
 
   // IMPORTANT for "build once, deploy everywhere":
-  // A relative base ('./') makes every asset URL in dist/index.html relative.
-  // That lets the exact same dist/ folder work at BOTH
-  //   https://<user>.github.io/cicd-demo-dev/   (Development)
-  //   https://<user>.github.io/cicd-demo/       (Production)
+  // A relative base ('./') makes every asset URL in dist/index.html relative,
+  // so the exact same dist/ folder works on ANY host or path — the Development
+  // and Production Vercel sites, `vite preview`, or even a sub-folder —
   // without rebuilding for each environment.
   base: './',
 

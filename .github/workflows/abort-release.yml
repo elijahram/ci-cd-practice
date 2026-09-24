@@ -35,9 +35,10 @@ jobs:
     permissions:
       contents: read
       statuses: write
+      deployments: read # look up the current Development URL
     env:
       GH_TOKEN: ${{ github.token }}
-      DEV_URL: ${{ vars.DEV_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
+      DEV_URL_OVERRIDE: ${{ vars.DEV_URL }}
       INPUT_SHA: ${{ inputs.release-sha }}
       REASON: ${{ inputs.reason }}
     steps:
@@ -50,6 +51,9 @@ jobs:
           if [ -n "$INPUT_SHA" ]; then
             sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}" --jq .sha)
           else
+            DEV_URL="${DEV_URL_OVERRIDE:-$(scripts/environment-url.sh development)}"
+            DEV_URL="${DEV_URL%/}/"
+            echo "Development URL: $DEV_URL"
             sha=$(curl -sSf "${DEV_URL}release.json?nocache=$(date +%s%N)" | jq -r .sha)
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"

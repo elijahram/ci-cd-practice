@@ -1,12 +1,15 @@
 // The SAME build artifact is deployed to both Development and Production.
 // That means we cannot bake "this is dev" into the build. Instead, the app
-// looks at the URL it is being served from at runtime.
+// looks at the host name it is being served from at runtime:
+//   cicd-demo-dev.vercel.app (or cicd-demo-dev-xxxx.vercel.app) -> Development
+//   cicd-demo.vercel.app     (or cicd-demo-xxxx.vercel.app)     -> Production
+//   localhost, anything else                                     -> Local
 
 export type Environment = 'Development' | 'Production' | 'Local';
 
-export function getEnvironment(pathname: string): Environment {
-  if (pathname.startsWith('/cicd-demo-dev')) return 'Development';
-  if (pathname.startsWith('/cicd-demo')) return 'Production';
+export function getEnvironment(hostname: string): Environment {
+  if (hostname.startsWith('cicd-demo-dev')) return 'Development';
+  if (hostname.startsWith('cicd-demo')) return 'Production';
   return 'Local';
 }
 

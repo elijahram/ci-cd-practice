@@ -11,13 +11,15 @@ Developer writes code → Pull Request → CI checks → Merge → Build ONE art
 Nothing in the pipeline is faked: the checks, coverage enforcement, builds, artifacts, deployments,
 health checks, and Playwright runs against the live sites are all real.
 
-| Environment | URL                                                | Deployed from                                 |
-| ----------- | -------------------------------------------------- | --------------------------------------------- |
-| Development | `https://<your-username>.github.io/cicd-demo-dev/` | `gh-pages` branch of the `cicd-demo-dev` repo |
-| Production  | `https://<your-username>.github.io/cicd-demo/`     | GitHub Pages of this `cicd-demo` repo         |
+| Environment | URL (example)                      | Hosted by                          |
+| ----------- | ---------------------------------- | ---------------------------------- |
+| Development | `https://cicd-demo-dev.vercel.app` | Vercel project **`cicd-demo-dev`** |
+| Production  | `https://cicd-demo.vercel.app`     | Vercel project **`cicd-demo`**     |
 
-> For the GitHub account `elijahram` these are
-> `https://elijahram.github.io/cicd-demo-dev/` and `https://elijahram.github.io/cicd-demo/`.
+> Vercel picks the exact domain when you create each project. If `cicd-demo.vercel.app` is already
+> taken by someone else, you'll get something like `cicd-demo-elijahram.vercel.app`. The pipeline
+> discovers the real domain automatically, and you can always find it in the Vercel dashboard under
+> the project's **Domains**.
 
 The app shows a colored **environment badge** (DEVELOPMENT / PRODUCTION / LOCAL) and, in the footer,
 the **commit it was built from**. Open both sites after a release and you'll see the same commit in
@@ -53,7 +55,7 @@ both: that's "build once, promote the same artifact" made visible.
 | Playwright                     | End-to-end (E2E) browser tests, locally and against live sites   |
 | GitHub Actions                 | Runs the whole pipeline                                          |
 | GitHub Environments            | `development` and `production`, with their own secrets/variables |
-| GitHub Pages                   | Free hosting for both environments                               |
+| Vercel (Hobby plan)            | Free hosting for both environments                               |
 
 ---
 
@@ -101,7 +103,9 @@ cicd-demo/
 │   ├── fingerprint.sh        # SHA-256 of the whole build → proves "same artifact"
 │   ├── health-check.sh       # HTTP 200 check with retries
 │   ├── wait-for-release.sh   # waits until a site serves a specific commit
-│   └── release-status.sh     # reads/writes the "release-control" commit status
+│   ├── release-status.sh     # reads/writes the "release-control" commit status
+│   ├── deploy-vercel.sh      # uploads the prebuilt artifact to a Vercel project (no rebuild)
+│   └── environment-url.sh    # finds the current Development URL from GitHub's deployment history
 ├── .github/
 │   ├── actions/setup-project/action.yml   # shared "setup Node + npm ci" steps
 │   └── workflows/
@@ -114,7 +118,8 @@ cicd-demo/
 ├── vite.config.ts            # Vite + Vitest + 100% coverage thresholds
 ├── playwright.config.ts
 ├── eslint.config.js
-└── .prettierrc.json
+├── .prettierrc.json
+└── vercel.json               # safety net: stops Vercel from auto-building on git push
 ```
 
 ---
@@ -161,29 +166,127 @@ flowchart TD
 
 ## Setup guide (step by step)
 
-You need Git, Node.js 22, and a GitHub account. Everything below uses the GitHub website. Replace
-`<your-username>` with your GitHub username everywhere.
+You need Git, Node.js 22, a GitHub account and a free Vercel account. Replace `<your-username>`
+with your GitHub username.
 
-> **Both repositories must be public.** GitHub Pages is free for public repositories. Public repos
-> also get unlimited free GitHub Actions minutes, which matters because the soak job keeps a runner
-> busy for an hour.
+> **Coming from the GitHub Pages version of this project?** You no longer need the
+> `cicd-demo-dev` **GitHub** repository or the `DEV_PAGES_DEPLOY_TOKEN` secret. Delete the secret
+> (Settings → Environments → development), turn off Pages (Settings → Pages), and delete the
+> `cicd-demo-dev` GitHub repo if you like. Then follow steps 2–6 below.
 
-### 1. Create the GitHub repositories
+### 1. Create the GitHub repository
 
-You need **two** repositories because one GitHub repository can host only one GitHub Pages site.
+github.com → **+** (top right) → **New repository**
 
-1. **`cicd-demo`**: github.com → **+** (top right) → **New repository**
-   - Name: `cicd-demo`, **Public**
-   - Do **not** add a README, .gitignore or license (the repo must be empty).
-2. **`cicd-demo-dev`**: **New repository** again
-   - Name: `cicd-demo-dev`, **Public**
-   - ✅ **Add a README file** (it needs at least one commit)
-   - This repo holds **no source code**. The pipeline pushes the built website into its `gh-pages`
-     branch.
-3. In `cicd-demo-dev`, create the `gh-pages` branch: on the repo's main page, click the branch
-   dropdown (says `main`) → type `gh-pages` → **Create branch gh-pages from main**.
+- Name: `cicd-demo`. **Public** is recommended: public repos get unlimited free GitHub Actions
+  minutes, which matters because the soak job keeps a runner busy for an hour.
+- Do **not** add a README, .gitignore or license (the repo must be empty).
 
-### 2. Push the project
+### 2. Create the two Vercel projects
+
+Sign up at [vercel.com](https://vercel.com) (the free **Hobby** plan is enough). Then, in a terminal:
+
+```bash
+npm install -g vercel     # the Vercel command-line tool
+vercel login              # opens your browser to log in
+
+vercel project add cicd-demo-dev    # the DEVELOPMENT site
+vercel project add cicd-demo        # the PRODUCTION site
+```
+
+> ⚠️ **Do not click "Import Git Repository" in the Vercel dashboard.** That would connect Vercel to
+> GitHub, and Vercel would then build and deploy _every push by itself_, skipping all of our checks,
+> the soak window, and the "build once" rule. In this project **GitHub Actions is in charge** and
+> Vercel is only the host. (`vercel.json` also turns Git deployments off as a safety net.)
+
+**Why two Vercel projects?** Each project has one stable public "production domain" that always
+points at its latest deployment. Using one project for Development and one for Production gives us
+two real, public URLs, and lets us upload the **same files** to both.
+
+(Vercel also has its own "Preview → Promote to Production" feature, but promoting a preview
+deployment **rebuilds** it, which breaks the build-once rule we're here to learn. Preview URLs are
+also password-protected by default, so Playwright couldn't open them without extra setup.)
+
+**Get the IDs the pipeline needs.** Link a scratch folder to each project and read the IDs it
+writes:
+
+```bash
+mkdir -p ~/vercel-ids && cd ~/vercel-ids
+
+vercel link --yes --project cicd-demo-dev
+cat .vercel/project.json        # {"projectId":"prj_AAA...","orgId":"team_XXX..."}
+
+rm -rf .vercel
+vercel link --yes --project cicd-demo
+cat .vercel/project.json        # {"projectId":"prj_BBB...","orgId":"team_XXX..."}
+```
+
+Write down three values: `orgId` (the same for both), the **dev** `projectId`, and the **prod**
+`projectId`. (You can also find them in the Vercel dashboard: Project → **Settings** → **General** →
+_Project ID_, and Team **Settings** → **General** → _Team ID_.) You can delete `~/vercel-ids`
+afterwards.
+
+### 3. Create a Vercel token
+
+GitHub Actions needs a token to deploy on your behalf.
+
+1. vercel.com → your avatar → **Account Settings** → **Tokens** (or go to
+   `vercel.com/account/settings/tokens`).
+2. **Create Token**:
+   - Name: `github-actions-cicd-demo`
+   - Scope: your team (the one that owns the two projects)
+   - Expiration: 90 days (or whatever you prefer)
+3. Copy the token (you won't see it again).
+
+**Why a token, and why is it a secret?** Anyone who holds it can deploy to (or delete) projects in
+that Vercel team. So it lives only in GitHub **Secrets**, which are encrypted, never shown again in
+the UI, and automatically hidden (`***`) in workflow logs. Vercel tokens can't be limited to a single
+project, so the smallest scope available is: one team, with an expiry date. For stricter separation,
+create **two** tokens (one per environment) so either can be revoked on its own.
+
+### 4. Configure GitHub: environments, secret and variables
+
+In **`cicd-demo`** on GitHub:
+
+**a) Repository variable** (shared by both environments): Settings → **Secrets and variables** →
+**Actions** → **Variables** tab → **New repository variable**
+
+| Name            | Value                                |
+| --------------- | ------------------------------------ |
+| `VERCEL_ORG_ID` | the `orgId` (`team_...`) from step 2 |
+
+**b) `development` environment**: Settings → **Environments** → **New environment** → `development`
+(if it already exists, click it)
+
+- **Environment secrets** → **Add environment secret**: `VERCEL_TOKEN` = the token from step 3
+- **Environment variables** → **Add environment variable**: `VERCEL_PROJECT_ID` = the **dev**
+  `projectId`
+
+**c) `production` environment**: **New environment** → `production`
+
+- **Environment secrets** → `VERCEL_TOKEN` = the token (or your second token)
+- **Environment variables** → `VERCEL_PROJECT_ID` = the **prod** `projectId`
+- **Deployment branches and tags** → change "No restriction" to **Selected branches and tags** →
+  **Add deployment branch or tag rule** → `main`. Now only code on `main` can ever reach Production.
+
+**This is what GitHub Environments are for.** Both deploy jobs run the _same_ script
+(`scripts/deploy-vercel.sh`) with the _same_ artifact. The only difference is which environment the
+job uses, and therefore which `VERCEL_PROJECT_ID` it receives: dev project or prod project.
+
+Optional environment variable in either environment: `APP_URL` (e.g.
+`https://cicd-demo-dev.vercel.app/`) if you ever want to force a specific URL instead of letting the
+pipeline discover it.
+
+### 5. Configure GitHub Actions
+
+In `cicd-demo` → Settings → Actions → General:
+
+- **Actions permissions:** "Allow all actions and reusable workflows" (the default).
+- **Workflow permissions:** "**Read repository contents and packages permissions**" (read-only).
+  Our workflows ask for extra permissions only on the specific jobs that need them (see
+  [permissions](#github-action-permissions-least-privilege)).
+
+### 6. Push the project
 
 From the project folder on your computer:
 
@@ -196,91 +299,12 @@ git remote add origin https://github.com/<your-username>/cicd-demo.git
 git push -u origin main
 ```
 
-This push to `main` immediately starts the **Release Pipeline** (Actions tab). The CI jobs will go
-green, then **Deploy Development will fail** with `DEV_PAGES_DEPLOY_TOKEN is not set`. **That is
-expected.** We add that secret in step 6 and re-run the pipeline.
+(Already pushed the GitHub Pages version? Copy the new files over your folder, then
+`git add -A && git commit -m "Deploy with Vercel" && git push`. Branch protection isn't set up yet,
+so you can push straight to `main` this once.)
 
-### 3. Enable GitHub Pages
-
-**Production** (`cicd-demo` repo):
-
-- Settings → Pages → **Build and deployment** → Source: **GitHub Actions**
-
-**Development** (`cicd-demo-dev` repo):
-
-- Settings → Pages → Source: **Deploy from a branch** → Branch: **`gh-pages`**, folder **`/ (root)`**
-  → **Save**
-
-Why two different methods? Production is deployed by this repo's own workflow with GitHub's
-official `actions/deploy-pages`. Development lives in a different repo, so we deploy it the simplest
-cross-repo way: push the files to the `gh-pages` branch, and GitHub Pages serves that branch.
-
-### 4. Configure GitHub Actions
-
-In `cicd-demo` → Settings → Actions → General:
-
-- **Actions permissions:** "Allow all actions and reusable workflows" (the default).
-- **Workflow permissions:** "**Read repository contents and packages permissions**" (read-only).
-  Our workflows ask for extra permissions only on the specific jobs that need them (see
-  [permissions](#github-action-permissions-least-privilege)).
-
-### 5. Create the Development and Production environments
-
-In `cicd-demo` → Settings → **Environments**. The first pipeline run may have created them already.
-If so, click each one to edit it; otherwise click **New environment**.
-
-**`development`**
-
-- Nothing is required besides the secret in step 6.
-- Optional **environment variables** (Add environment variable):
-  - `APP_URL` = `https://<your-username>.github.io/cicd-demo-dev/`
-  - `PAGES_REPO` = `<your-username>/cicd-demo-dev`
-
-  (If you skip these, the workflow uses exactly these values by default.)
-
-**`production`**
-
-- **Deployment branches and tags** → change "No restriction" to **Selected branches and tags** →
-  **Add deployment branch or tag rule** → `main`. Now only code on `main` can ever reach
-  Production.
-- Optional: environment variable `APP_URL` = `https://<your-username>.github.io/cicd-demo/`
-  (for your own reference; the real Production URL comes from GitHub Pages).
-
-### 6. Create the secret (a fine-grained Personal Access Token)
-
-**Why do we need a token?** Every workflow run gets an automatic `GITHUB_TOKEN`, but it can only
-access **the repository the workflow is running in** (`cicd-demo`). Deploying Development means
-pushing files to a **different** repository (`cicd-demo-dev`), so we need a token that can write to
-that one repo, and only that repo.
-
-**Create the token:**
-
-1. github.com → your avatar → **Settings** → **Developer settings** → **Personal access tokens** →
-   **Fine-grained tokens** → **Generate new token**
-2. Name: `cicd-demo-dev deploy`. Expiration: 90 days (or whatever you prefer).
-3. **Repository access:** **Only select repositories** → pick **`cicd-demo-dev`** only.
-4. **Permissions** → Repository permissions → **Contents: Read and write**. (Metadata: Read-only is
-   added automatically.) **Nothing else.**
-5. **Generate token** and copy it (you won't see it again).
-
-With that token, the worst anyone could do is change files in `cicd-demo-dev`. That's
-**least privilege**.
-
-**Store it as a secret** in `cicd-demo`:
-
-- Settings → Environments → **development** → **Environment secrets** → **Add environment secret**
-  - Name: `DEV_PAGES_DEPLOY_TOKEN`
-  - Value: the token
-
-We use an _environment_ secret (not a repository secret) so only jobs that deploy to `development`
-can read it. If you prefer a repository secret, the path is Settings → **Secrets and variables** →
-**Actions** → **New repository secret**, with the same name. The workflow works either way.
-
-That is the **only** secret this project needs. Production uses GitHub's built-in OIDC
-(`id-token: write`) to deploy to its own Pages site, so it needs no stored credentials.
-
-**Now re-run the first pipeline:** Actions → **Release Pipeline** → the failed run → **Re-run all
-jobs**. Watch it deploy Development, test it, and start the soak.
+The push to `main` starts the **Release Pipeline** (Actions tab). Watch it run CI, deploy to the
+Development Vercel project, test it, and start the soak.
 
 ### 7. Configure branch protection
 
@@ -358,15 +382,16 @@ Actions → **Release Pipeline** → the newest run. The graph shows:
 CI on main (all 7 jobs again) → Deploy Development → Test Development → Development Soak → Production
 ```
 
-**Deploy Development** pushes the artifact to `cicd-demo-dev`, then waits until the live site
-reports the new commit in `/release.json`. **Test Development** runs a health check and the full
+**Deploy Development** uploads the artifact to the `cicd-demo-dev` Vercel project, then waits until
+the live site reports the new commit in `/release.json`. **Test Development** runs a health check and the full
 Playwright suite against the real URL.
 
 ### 13. Open the Development URL
 
-`https://<your-username>.github.io/cicd-demo-dev/`: you should see the yellow **DEVELOPMENT** badge,
-and the footer shows the commit from your merge. The URL is also clickable on the **Deploy
-Development** box in the workflow graph.
+Click the URL on the **Deploy Development** box in the workflow graph (or find it in Vercel →
+`cicd-demo-dev` → **Domains**, e.g. `https://cicd-demo-dev.vercel.app`). You should see the yellow
+**DEVELOPMENT** badge, and the footer shows the commit from your merge. You can also watch the new
+deployment appear in the Vercel dashboard under **Deployments**.
 
 ### 14. Test it manually
 
@@ -414,8 +439,9 @@ The summary says **AUTOMATIC PROMOTION after the Development soak window**.
 
 ### 18. Open the Production URL
 
-`https://<your-username>.github.io/cicd-demo/`: green **PRODUCTION** badge, and the footer shows
-**the same commit and run number** as Development. Same artifact, two environments.
+Click the URL on the **Deploy Production** box (or Vercel → `cicd-demo` → **Domains**). Green
+**PRODUCTION** badge, and the footer shows **the same commit and run number** as Development. Same
+artifact, two environments.
 
 ---
 
@@ -599,7 +625,6 @@ works. Teams use lots of unit tests and a few important E2E journeys (the "testi
 dist/
 ├── index.html
 ├── favicon.svg
-├── .nojekyll
 ├── release.json          ← added by CI: commit, run, fingerprint
 └── assets/
     ├── index-BEPWsjes.js ← all of React + your app, minified
@@ -608,8 +633,14 @@ dist/
 
 **Those files are what actually get deployed.** Browsers never see `App.tsx`; they get `dist/`.
 
-`vite.config.ts` sets `base: './'` so every asset URL is **relative**. That's what lets the
-identical `dist/` work both under `/cicd-demo-dev/` and `/cicd-demo/`.
+`vite.config.ts` sets `base: './'` so every asset URL is **relative**. The identical `dist/` works
+on any host or path: both Vercel sites, `vite preview`, or a sub-folder.
+
+**Deploying without rebuilding on Vercel:** Vercel normally builds your source code on its own
+servers. We don't let it. `scripts/deploy-vercel.sh` puts the artifact's files into Vercel's
+[Build Output API](https://vercel.com/docs/build-output-api) layout (`.vercel/output/static/`) and
+runs `vercel deploy --prebuilt --prod`, which uploads those exact files. Vercel runs no `npm
+install` and no `npm run build`.
 
 ### Build artifacts
 
@@ -659,7 +690,8 @@ mismatch), and finally compared against what the live Production site serves. Ch
 the fingerprint changes.
 
 It's also why the app can't have "this is Development" baked in at build time. Instead,
-`src/environment.ts` looks at the URL at runtime to decide which badge to show.
+`src/environment.ts` looks at the host name at runtime (`cicd-demo-dev…` = Development,
+`cicd-demo…` = Production) to decide which badge to show.
 
 ### Continuous Delivery / Continuous Deployment
 
@@ -737,7 +769,8 @@ If Development has been tested thoroughly and everything looks right, waiting th
 is pointless. **🚀 Promote Development to Production NOW** (a `workflow_dispatch` workflow, i.e. a
 manual "Run workflow" button) promotes it immediately. It:
 
-1. identifies the release currently in Development (reads `/release.json` from the Dev site),
+1. identifies the release currently in Development (finds the Dev URL in GitHub's deployment
+   history for the `development` environment, then reads `/release.json` from that site),
 2. verifies Development is healthy,
 3. confirms the release isn't aborted (or already promoted),
 4. downloads the **same artifact** from the original pipeline run,
@@ -771,9 +804,9 @@ After deploying to Production we still test it, with a small **smoke test**: the
 heading exists, a user can add one todo. Why, if Development already passed everything?
 
 - The **deployment itself** could have failed or been partial even though Development worked
-  (wrong settings, a Pages outage, a caching problem, a missing file).
-- Production is configured differently from Development (different repo, different deployment
-  method in this project).
+  (wrong project settings, a hosting outage, a domain problem, an expired token).
+- Production is a **different Vercel project** with its own settings and domain. Development
+  working doesn't prove Production is configured correctly.
 
 The smoke test is intentionally **small and non-destructive**: in a real system you don't want to
 create fake orders or spam real users. (Here todos live only in browser memory, so it's harmless.)
@@ -781,16 +814,23 @@ create fake orders or spam real users. (Here todos live only in browser memory, 
 **If the Production smoke test fails:** the job turns red, the release gets a `release-control`
 **error** status, and the summary explains what happened. Real companies often **roll back
 automatically** (re-deploy the previous good version). This project doesn't, to keep things simple.
-To roll back by hand, open the Release Pipeline run of the last good release and **re-run its
-Deploy Production job**, or revert the bad commit through a new PR.
+To roll back by hand, Vercel has **Instant Rollback**: Vercel dashboard → `cicd-demo` project →
+**Instant Rollback** on the Production Deployment tile (on the free Hobby plan you can go back to the
+immediately previous deployment). It points the production domain back at the old deployment in
+seconds, without rebuilding. Then fix the bug in a new PR.
+
+> After an Instant Rollback, Vercel stops moving the production domain to new deployments until you
+> click **Undo Rollback** on the same tile. Until then, the next pipeline run will fail at "Wait for
+> Production to serve this release". Real teams have to remember this too.
 
 ### GitHub Environments
 
 A **GitHub Environment** (`development`, `production`) is a named deployment target in your repo.
 Each one can have:
 
-- its own **secrets** (e.g. `DEV_PAGES_DEPLOY_TOKEN` exists only in `development`),
-- its own **variables** (`APP_URL`),
+- its own **secrets** (e.g. `VERCEL_TOKEN`),
+- its own **variables** (e.g. `VERCEL_PROJECT_ID`: the dev project in `development`, the prod
+  project in `production`),
 - **protection rules** (Production accepts deployments only from `main`; you could also add
   required reviewers or a wait timer),
 - a **deployment history** with URLs (repo main page → **Deployments**).
@@ -808,14 +848,16 @@ allows. So we give each job **only what it needs**:
 - workflows start with `permissions: {}` (nothing) or `contents: read`,
 - then individual jobs add what they need:
 
-| Permission        | Used by                              | Why                                            |
-| ----------------- | ------------------------------------ | ---------------------------------------------- |
-| `contents: read`  | almost all jobs                      | check out the code                             |
-| `actions: read`   | Deploy Production                    | download an artifact from another workflow run |
-| `pages: write`    | Deploy Production                    | publish to GitHub Pages                        |
-| `id-token: write` | Deploy Production                    | prove to GitHub Pages who is deploying (OIDC)  |
-| `statuses: write` | Soak, Deploy/Smoke Production, Abort | read/write the `release-control` commit status |
-| `statuses: read`  | Promote Early                        | read the `release-control` status              |
+| Permission          | Used by                              | Why                                            |
+| ------------------- | ------------------------------------ | ---------------------------------------------- |
+| `contents: read`    | almost all jobs                      | check out the code                             |
+| `actions: read`     | Deploy Production                    | download an artifact from another workflow run |
+| `statuses: write`   | Soak, Deploy/Smoke Production, Abort | read/write the `release-control` commit status |
+| `statuses: read`    | Promote Early                        | read the `release-control` status              |
+| `deployments: read` | Promote Early, Abort                 | find the current Development URL               |
+
+Deploying to Vercel needs **no** extra GitHub permissions: it uses the `VERCEL_TOKEN` secret, which
+only the jobs running in the `development` or `production` environment can read.
 
 PR workflows get **read-only** access, which is part of why PRs can never deploy.
 
@@ -845,17 +887,20 @@ Every workflow file is heavily commented. Reading them top to bottom is a good n
 
 Everything you configure, in one place:
 
-| What                     | Where                                                             | Required? | Value                                                |
-| ------------------------ | ----------------------------------------------------------------- | --------- | ---------------------------------------------------- |
-| `DEV_PAGES_DEPLOY_TOKEN` | `cicd-demo` → Settings → Environments → **development** → secrets | **Yes**   | fine-grained PAT, `cicd-demo-dev` only, Contents R/W |
-| `APP_URL`                | Environments → **development** → variables                        | No        | `https://<you>.github.io/cicd-demo-dev/`             |
-| `PAGES_REPO`             | Environments → **development** → variables                        | No        | `<you>/cicd-demo-dev`                                |
-| `APP_URL`                | Environments → **production** → variables                         | No        | `https://<you>.github.io/cicd-demo/` (reference)     |
-| `SOAK_MINUTES`           | Settings → Secrets and variables → Actions → **Variables**        | No        | default `60`; use `5` while learning (max 60)        |
-| `DEV_URL`                | Settings → Secrets and variables → Actions → **Variables**        | No        | only if your Dev URL differs from the default        |
+| What                | Where (in the `cicd-demo` GitHub repo)                     | Required? | Value                                         |
+| ------------------- | ---------------------------------------------------------- | --------- | --------------------------------------------- |
+| `VERCEL_ORG_ID`     | Settings → Secrets and variables → Actions → **Variables** | **Yes**   | Vercel team ID (`team_...`)                   |
+| `VERCEL_TOKEN`      | Settings → Environments → **development** → secrets        | **Yes**   | Vercel token                                  |
+| `VERCEL_PROJECT_ID` | Settings → Environments → **development** → variables      | **Yes**   | ID of the `cicd-demo-dev` Vercel project      |
+| `VERCEL_TOKEN`      | Settings → Environments → **production** → secrets         | **Yes**   | Vercel token (same or a second one)           |
+| `VERCEL_PROJECT_ID` | Settings → Environments → **production** → variables       | **Yes**   | ID of the `cicd-demo` Vercel project          |
+| `APP_URL`           | either environment → variables                             | No        | force a URL instead of auto-discovering it    |
+| `SOAK_MINUTES`      | Settings → Secrets and variables → Actions → **Variables** | No        | default `60`; use `5` while learning (max 60) |
+| `DEV_URL`           | Settings → Secrets and variables → Actions → **Variables** | No        | override the Dev URL for Promote/Abort        |
 
-Default URLs are built from your username, so if you keep the repo names `cicd-demo` and
-`cicd-demo-dev`, **only the secret is required**.
+You can store `VERCEL_TOKEN` once as a **repository** secret instead (Settings → Secrets and
+variables → Actions → **Secrets** → New repository secret). It works, but then every workflow in
+the repo can read it. Environment secrets are stricter.
 
 ---
 
@@ -863,8 +908,12 @@ Default URLs are built from your username, so if you keep the repo names `cicd-d
 
 Real companies use more (and bigger) tools:
 
-- **Hosting / infrastructure:** AWS, Azure, Google Cloud, Vercel, Netlify, **Docker** containers,
-  **Kubernetes** clusters.
+- **Hosting / infrastructure:** AWS, Azure, Google Cloud, Vercel (like here), Netlify, **Docker**
+  containers, **Kubernetes** clusters.
+- **Vercel's own workflow:** many teams let Vercel's Git integration build every branch as a
+  _preview deployment_ and use Vercel's staged production deployments plus **Promote** instead of a
+  second project. We use two projects + GitHub Actions so every step is visible and the artifact is
+  built exactly once.
 - **Pipeline tools:** GitHub Actions (like here), Jenkins, GitLab CI, CircleCI.
 - **Deployment tools:** **ArgoCD** (GitOps: the cluster syncs itself to what's in Git),
   **Spinnaker** (multi-stage cloud deployments with approvals).
@@ -895,15 +944,20 @@ But the **concepts are exactly the same** as in this small project:
 
 ## Troubleshooting
 
-| Symptom                                                           | Fix                                                                                                                         |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| **Deploy Development:** `DEV_PAGES_DEPLOY_TOKEN is not set`       | Setup step 6. The secret must be in the **development** environment (or a repository secret) with that exact name.          |
-| **Deploy Development:** `git push` 403 / "Permission denied"      | Token doesn't have **Contents: Read and write** on `cicd-demo-dev`, or it expired. Regenerate and update the secret.        |
-| **Deploy Development:** "Timed out ... serving 'nothing'"         | `cicd-demo-dev` → Settings → Pages must be **Deploy from a branch → gh-pages / root**, and the repo must be **public**.     |
-| **Deploy Production:** "Get Pages site failed" / 404              | `cicd-demo` → Settings → Pages → Source must be **GitHub Actions**.                                                         |
-| **Deploy Production:** "Branch ... is not allowed to deploy"      | The `production` environment only allows `main`. Run Promote from the `main` branch (the default in the Run workflow menu). |
-| Can't find `CI / All Checks Passed` in branch protection          | Open a PR first so the check runs once, then search again.                                                                  |
-| Promote Early: "has not finished its automated Development tests" | Wait until the pipeline reaches **Development Soak**.                                                                       |
-| Soak takes forever                                                | Set the repository variable `SOAK_MINUTES` to `5`.                                                                          |
-| `npm run test:e2e` locally: "Executable doesn't exist"            | Run `npx playwright install chromium` once.                                                                                 |
-| `npm run test:e2e` locally shows an old version                   | Run `npm run build` first: E2E tests the built `dist/` folder.                                                              |
+| Symptom                                                           | Fix                                                                                                                                          |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deploy Development:** `VERCEL_TOKEN is not set`                 | Setup step 4. The secret must be in the **development** environment (and **production** for Deploy Production), with that exact name.        |
+| `VERCEL_ORG_ID` or `VERCEL_PROJECT_ID is not set`                 | Setup step 4: `VERCEL_ORG_ID` is a **repository variable**; `VERCEL_PROJECT_ID` is an **environment variable** in each environment.          |
+| Vercel CLI: "The specified token is not valid" / 403              | Token expired, was revoked, or its scope is a different team than the projects. Create a new one (step 3) and update the secret.             |
+| Vercel CLI: "Project not found"                                   | `VERCEL_PROJECT_ID` / `VERCEL_ORG_ID` don't match. Re-run `vercel link` (step 2) and copy the IDs again.                                     |
+| **Wait for … to serve this release** times out                    | Check the Vercel project's **Settings → Deployment Protection** is **Standard Protection** (the default) and not "All Deployments".          |
+| Wait for Production times out after you used Instant Rollback     | Vercel dashboard → `cicd-demo` → **Undo Rollback** on the Production Deployment tile, then re-run the job.                                   |
+| Vercel deploys by itself on every push                            | The Git repo got connected to Vercel. Vercel → project → **Settings → Git** → **Disconnect**. (`vercel.json` also disables Git deployments.) |
+| Badge says LOCAL on Vercel                                        | Your Vercel domain doesn't start with `cicd-demo-dev` / `cicd-demo`. Keep those project names, or adjust `src/environment.ts`.               |
+| **Deploy Production:** "Branch ... is not allowed to deploy"      | The `production` environment only allows `main`. Run Promote from the `main` branch (the default in the Run workflow menu).                  |
+| Promote/Abort: "No successful 'development' deployment found"     | Development has never deployed successfully yet. Let the Release Pipeline get past **Deploy Development** first.                             |
+| Can't find `CI / All Checks Passed` in branch protection          | Open a PR first so the check runs once, then search again.                                                                                   |
+| Promote Early: "has not finished its automated Development tests" | Wait until the pipeline reaches **Development Soak**.                                                                                        |
+| Soak takes forever                                                | Set the repository variable `SOAK_MINUTES` to `5`.                                                                                           |
+| `npm run test:e2e` locally: "Executable doesn't exist"            | Run `npx playwright install chromium` once.                                                                                                  |
+| `npm run test:e2e` locally shows an old version                   | Run `npm run build` first: E2E tests the built `dist/` folder.                                                                               |
