@@ -1,0 +1,34 @@
+# =============================================================================
+# PHASE 2 — PULL REQUEST / CONTINUOUS INTEGRATION
+# =============================================================================
+# Runs whenever a Pull Request into main is opened or updated (new commits
+# pushed to the feature branch).
+#
+#   Feature Branch -> Pull Request -> ESLint -> Prettier -> Unit Tests
+#   -> 100% Coverage -> Build -> Playwright E2E -> All Green -> Safe to Merge
+#
+# IMPORTANT: this workflow NEVER deploys anything. Code from a Pull Request
+# has not been reviewed yet, so it must not reach Development or Production.
+# =============================================================================
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Least privilege: PR checks only need to read the repository.
+# Anything not listed here is set to "none".
+permissions:
+  contents: read
+
+# If you push again while checks are still running, cancel the old run.
+# Only the newest commit of a PR matters.
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci-checks.yml

@@ -1,0 +1,84 @@
+# =============================================================================
+# OPTION 3 — ABORT RELEASE
+# =============================================================================
+# A manual button: Actions → "🛑 Abort Development Release" → Run workflow
+#
+# Use it when Development looks wrong in a way the automated tests did not
+# catch (broken mobile layout, wrong colors, confusing behavior...).
+#
+# It marks the release as ABORTED using the "release-control" commit status.
+# The Development Soak job checks that status every minute; when it sees the
+# abort it stops, and Production is never touched. The pipeline shows a
+# "Release Aborted (Production skipped)" job, so it's clear this was a
+# deliberate decision and not a random failure.
+# =============================================================================
+name: '🛑 Abort Development Release'
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you aborting? (e.g. "Layout broken on mobile")'
+        required: true
+        type: string
+      release-sha:
+        description: 'Commit SHA to abort. Leave empty for the release currently in Development.'
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  abort:
+    name: Abort Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEV_URL: ${{ vars.DEV_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
+      INPUT_SHA: ${{ inputs.release-sha }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - name: Checkout repository (for helper scripts)
+        uses: actions/checkout@v7
+
+      - name: Identify the release to abort
+        id: release
+        run: |
+          if [ -n "$INPUT_SHA" ]; then
+            sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}" --jq .sha)
+          else
+            sha=$(curl -sSf "${DEV_URL}release.json?nocache=$(date +%s%N)" | jq -r .sha)
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Release to abort: $sha"
+
+      - name: Mark the release as ABORTED
+        env:
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          state=$(scripts/release-status.sh get "$SHA")
+          case "$state" in
+            success|error)
+              echo "::error title=Too late to abort::${SHA::7} has already been promoted to Production. To undo it, revert the change in a new Pull Request."
+              exit 1 ;;
+            failure)
+              echo "::notice title=Already aborted::${SHA::7} was already aborted: $(scripts/release-status.sh describe "$SHA")"
+              exit 0 ;;
+          esac
+
+          scripts/release-status.sh set "$SHA" failure "ABORTED by @${GITHUB_ACTOR}: ${REASON}"
+          echo "::warning title=Release aborted::${SHA::7} aborted by @${GITHUB_ACTOR}: ${REASON}"
+          {
+            echo "## 🛑 Release \`${SHA::7}\` ABORTED"
+            echo ""
+            echo "- **By:** @${GITHUB_ACTOR}"
+            echo "- **Reason:** ${REASON}"
+            echo ""
+            echo "Production will not receive this release. The Development Soak job"
+            echo "in the Release Pipeline will notice within about a minute and stop."
+            echo ""
+            echo "**Next step:** fix the problem on a new feature branch and open a new Pull Request."
+          } >> "$GITHUB_STEP_SUMMARY"

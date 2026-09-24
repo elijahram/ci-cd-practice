@@ -1,0 +1,266 @@
+# =============================================================================
+# CI CHECKS  (reusable workflow)
+# =============================================================================
+# This file is NOT triggered directly. It is "called" by:
+#   - pr-checks.yml         -> on every Pull Request into main
+#   - release-pipeline.yml  -> again on main, right after a merge
+#
+# Keeping the checks in ONE file guarantees the Pull Request and the release
+# run exactly the same checks.
+#
+# The jobs run one after another on purpose, so you can WATCH the pipeline
+# move step by step in the GitHub Actions graph:
+#
+#   Lint Code -> Check Formatting -> Run Unit Tests -> Check 100% Coverage
+#             -> Build Application -> Run E2E Tests -> All Checks Passed
+#
+# (Real teams often run the independent checks in parallel to save time.)
+# If ANY job fails, every job after it is skipped and the run turns red.
+# =============================================================================
+name: CI Checks
+
+on:
+  workflow_call:
+    outputs:
+      fingerprint:
+        description: SHA-256 fingerprint of the build artifact (see scripts/fingerprint.sh)
+        value: ${{ jobs.build.outputs.fingerprint }}
+
+# Least privilege: these checks only need to READ the code.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # ESLint = code QUALITY. Catches bugs and bad patterns (unused variables,
+  # React hooks called conditionally, etc.) before code is merged.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+      - name: Run ESLint
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # Prettier = code FORMATTING. `format:check` only verifies, it never edits.
+  # If this fails, run `npm run format` locally and commit the result.
+  # ---------------------------------------------------------------------------
+  format:
+    name: Check Formatting
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+      - name: Run Prettier check
+        run: npm run format:check
+
+  # ---------------------------------------------------------------------------
+  # Unit tests (Vitest + React Testing Library): fast, isolated tests of the
+  # app's behavior, run in a simulated browser (jsdom).
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Run Unit Tests
+    needs: format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+      - name: Run unit tests
+        run: npm run test
+
+  # ---------------------------------------------------------------------------
+  # Coverage: re-runs the unit tests while measuring which code they executed.
+  # The 100% thresholds live in vite.config.ts -> Vitest exits with an error
+  # (and this job fails) if statements/branches/functions/lines drop below 100%.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Check 100% Coverage
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+      - name: Run tests with coverage (must be 100%)
+        run: npm run test:coverage
+
+      # Show the numbers on the run's Summary page so you don't have to dig
+      # through logs. `if: always()` = also show them when coverage is too low.
+      - name: Add coverage table to the job summary
+        if: always() && hashFiles('coverage/coverage-summary.json') != ''
+        run: |
+          {
+            echo "## Test coverage (required: 100%)"
+            echo "| Metric | Covered |"
+            echo "|---|---|"
+            jq -r '.total | to_entries[] | select(.key != "branchesTrue") | "| \(.key) | \(.value.pct)% |"' coverage/coverage-summary.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # BUILD ONCE. This is the ONLY place in the whole project where
+  # `npm run build` runs in CI. The dist/ folder it produces is saved as the
+  # "react-build-artifact". Every later stage (E2E tests, Development,
+  # Production) receives these exact files. Nothing is ever rebuilt.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Application
+    needs: coverage
+    runs-on: ubuntu-latest
+    outputs:
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+
+      # The VITE_* variables are baked into the JavaScript so the page footer
+      # shows which commit it was built from. Because Dev and Prod get the
+      # same artifact, both sites will show the SAME commit.
+      - name: Build with Vite (npm run build)
+        run: npm run build
+        env:
+          VITE_BUILD_SHA: ${{ github.sha }}
+          VITE_BUILD_RUN_NUMBER: ${{ github.run_number }}
+
+      # Fingerprint every file in dist/. Deploy jobs recompute this and refuse
+      # to deploy if it differs -> proof that nothing was rebuilt or modified.
+      - name: Fingerprint the build output
+        id: fingerprint
+        run: |
+          fingerprint=$(scripts/fingerprint.sh dist)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "Build fingerprint: $fingerprint"
+
+      # release.json travels inside the artifact. Deployed sites expose it at
+      # <site>/release.json so the pipeline can ask "which release are you
+      # serving?" (used by health checks, Promote and Abort).
+      - name: Write release.json
+        run: |
+          jq -n \
+            --arg sha "$GITHUB_SHA" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runNumber "$GITHUB_RUN_NUMBER" \
+            --arg builtAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg fingerprint "${{ steps.fingerprint.outputs.fingerprint }}" \
+            '{sha: $sha, runId: $runId, runNumber: $runNumber, builtAt: $builtAt, fingerprint: $fingerprint}' \
+            > dist/release.json
+          cat dist/release.json
+
+      # Store dist/ as a versioned GitHub Actions artifact. You can download it
+      # from the run's Summary page. include-hidden-files keeps .nojekyll.
+      - name: Create Build Artifact (react-build-artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: react-build-artifact
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add build info to the job summary
+        run: |
+          {
+            echo "## 📦 Build artifact created"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Artifact | \`react-build-artifact\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Fingerprint | \`${{ steps.fingerprint.outputs.fingerprint }}\` |"
+            echo ""
+            echo "Files:"
+            echo '```'
+            find dist -type f | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # E2E tests (Playwright): a real Chromium browser clicks through the app like
+  # a user would. We test the ARTIFACT we just built (downloaded, not rebuilt),
+  # served locally by `vite preview`.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: Run E2E Tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: react-build-artifact
+          path: dist
+
+      - name: Verify artifact fingerprint
+        run: |
+          actual=$(scripts/fingerprint.sh dist)
+          expected="${{ needs.build.outputs.fingerprint }}"
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          test "$actual" = "$expected"
+
+      # Playwright needs a real browser. We only install Chromium to keep CI fast.
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      # playwright.config.ts starts `vite preview` (serving dist/) automatically
+      # when BASE_URL is not set, waits for it, runs the tests, then stops it.
+      - name: Run Playwright E2E tests against the built app
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-ci
+          path: playwright-report/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # One final "gate" job. Branch protection only needs to require THIS check.
+  #
+  # Why `if: always()`? Normally a job whose dependency failed is SKIPPED, and
+  # GitHub treats a skipped required check as passing! Running always and then
+  # checking every result ourselves closes that loophole.
+  # ---------------------------------------------------------------------------
+  all-checks-passed:
+    name: All Checks Passed
+    if: always()
+    needs: [lint, format, unit-tests, coverage, build, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every check succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$RESULTS" | jq -e 'any(.[]; .result != "success")' > /dev/null; then
+            echo "::error title=Not safe to merge::At least one CI check did not succeed."
+            exit 1
+          fi
+          echo "✅ All green — safe to merge"
+          echo "## ✅ All green — safe to merge" >> "$GITHUB_STEP_SUMMARY"

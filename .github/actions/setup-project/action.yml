@@ -1,0 +1,24 @@
+# A small reusable "composite action".
+# Almost every job needs Node + the project's dependencies, so instead of
+# copy-pasting these steps into every job we define them once here.
+name: Set up project
+description: Install Node.js and the exact dependencies from package-lock.json
+
+runs:
+  using: composite
+  steps:
+    # Use the Node version pinned in .nvmrc, so CI and your laptop agree.
+    # `cache: npm` re-uses downloaded packages between runs to save time.
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    # We use `npm ci` instead of `npm install` because CI should install
+    # EXACTLY the dependency versions stored in package-lock.json.
+    # `npm ci` never changes the lock file and fails if it is out of sync
+    # with package.json, which makes builds reproducible.
+    - name: Install dependencies (npm ci)
+      shell: bash
+      run: npm ci

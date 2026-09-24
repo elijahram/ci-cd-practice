@@ -1,0 +1,99 @@
+# =============================================================================
+# OPTION 2 — PROMOTE EARLY
+# =============================================================================
+# A manual button: Actions → "🚀 Promote Development to Production NOW"
+#                  → Run workflow
+#
+# Use it when you have already tested Development and don't want to wait for
+# the rest of the soak window. It deploys the SAME artifact that Development
+# is running — it never rebuilds.
+# =============================================================================
+name: '🚀 Promote Development to Production NOW'
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type PROMOTE to send the release currently in Development to Production now'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  identify:
+    name: Identify Development Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      run-id: ${{ steps.release.outputs.run-id }}
+      fingerprint: ${{ steps.release.outputs.fingerprint }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEV_URL: ${{ vars.DEV_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "PROMOTE" ]; then
+            echo "::error title=Not confirmed::You must type PROMOTE (all caps) to promote early."
+            exit 1
+          fi
+
+      - name: Checkout repository (for helper scripts)
+        uses: actions/checkout@v7
+
+      # 1. Identify the current Development release by asking the live site.
+      - name: Identify the release currently in Development
+        id: release
+        run: |
+          json=$(curl -sSf "${DEV_URL}release.json?nocache=$(date +%s%N)")
+          echo "$json" | jq .
+          {
+            echo "sha=$(echo "$json" | jq -r .sha)"
+            echo "run-id=$(echo "$json" | jq -r .runId)"
+            echo "fingerprint=$(echo "$json" | jq -r .fingerprint)"
+          } >> "$GITHUB_OUTPUT"
+
+      # 2. Development must be healthy.
+      - name: Verify Development is healthy
+        run: scripts/health-check.sh "$DEV_URL"
+
+      # 3. The release must be soaking — not aborted, not already shipped,
+      #    and not still in the middle of its automated Development tests.
+      - name: Confirm the release is not aborted
+        env:
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          state=$(scripts/release-status.sh get "$SHA")
+          desc=$(scripts/release-status.sh describe "$SHA")
+          echo "release-control for ${SHA::7}: $state ($desc)"
+          case "$state" in
+            pending|error) echo "✅ OK to promote" ;;
+            failure) echo "::error title=Release aborted::${SHA::7} was aborted: $desc"; exit 1 ;;
+            success) echo "::error title=Already promoted::${SHA::7} is already in Production: $desc"; exit 1 ;;
+            none)    echo "::error title=Not ready::${SHA::7} has not finished its automated Development tests yet."; exit 1 ;;
+          esac
+          {
+            echo "## 🚀 EARLY MANUAL PROMOTION requested by @${GITHUB_ACTOR}"
+            echo "Release \`${SHA}\` (currently in Development) → Production"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 4-7. Deploy the exact same artifact using the shared production workflow.
+  production:
+    name: Production
+    needs: identify
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+      statuses: write
+    uses: ./.github/workflows/deploy-production.yml
+    with:
+      artifact-run-id: ${{ needs.identify.outputs.run-id }}
+      release-sha: ${{ needs.identify.outputs.sha }}
+      expected-fingerprint: ${{ needs.identify.outputs.fingerprint }}
+      promotion-type: early-manual

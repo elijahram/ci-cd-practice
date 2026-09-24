@@ -1,0 +1,193 @@
+# =============================================================================
+# PHASE 6 — PRODUCTION DEPLOYMENT  (reusable workflow)
+# =============================================================================
+# Called by BOTH ways of reaching Production:
+#   - release-pipeline.yml  -> automatic promotion after the soak window
+#   - promote-early.yml     -> manual "Promote NOW" button
+#
+# Either way it:
+#   1. downloads the SAME react-build-artifact that went to Development
+#   2. verifies its fingerprint (proves it is byte-for-byte identical)
+#   3. deploys it to GitHub Pages (NO rebuild)
+#   4. waits until Production serves it
+#   5. runs an HTTP health check
+#   6. runs a small Playwright smoke test
+# =============================================================================
+name: Deploy Production
+
+on:
+  workflow_call:
+    inputs:
+      artifact-run-id:
+        description: ID of the pipeline run that built the artifact
+        type: string
+        required: true
+      release-sha:
+        description: Commit being released
+        type: string
+        required: true
+      expected-fingerprint:
+        description: Fingerprint the artifact must have
+        type: string
+        required: true
+      promotion-type:
+        description: "'automatic' or 'early-manual'"
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # needed to download an artifact from another run
+      pages: write
+      id-token: write
+      statuses: write
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.page_url }}
+    # Only one production deployment at a time, and never cancel one halfway.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    outputs:
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ inputs.release-sha }}
+    steps:
+      - name: Announce how this release reached Production
+        run: |
+          if [ "${{ inputs.promotion-type }}" = "early-manual" ]; then
+            title="🚀 EARLY MANUAL PROMOTION by @${GITHUB_ACTOR}"
+          else
+            title="⏰ AUTOMATIC PROMOTION after the Development soak window"
+          fi
+          echo "::notice title=Production promotion::${title} (release ${RELEASE_SHA::7})"
+          echo "## ${title}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release \`${RELEASE_SHA}\` from build run ${{ inputs.artifact-run-id }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout release (for helper scripts)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release-sha }}
+
+      # Mark the release as promoted right away. This is what makes the
+      # soak loop in the pipeline stop waiting when someone promotes early.
+      - name: Mark release as promoted
+        run: |
+          if [ "${{ inputs.promotion-type }}" = "early-manual" ]; then
+            desc="Promoted to Production EARLY by @${GITHUB_ACTOR}"
+          else
+            desc="Promoted to Production automatically after soak"
+          fi
+          scripts/release-status.sh set "$RELEASE_SHA" success "$desc"
+
+      # Production uses the same artifact as Development so that we deploy
+      # exactly what we already tested. `run-id` lets us fetch it from the
+      # original pipeline run, even when this is a separate "Promote NOW" run.
+      - name: Download the SAME build artifact used in Development
+        uses: actions/download-artifact@v8
+        with:
+          name: react-build-artifact
+          path: site
+          run-id: ${{ inputs.artifact-run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify artifact fingerprint (proves nothing was rebuilt)
+        run: |
+          actual=$(scripts/fingerprint.sh site)
+          echo "expected: ${{ inputs.expected-fingerprint }}"
+          echo "actual:   $actual"
+          test "$actual" = "${{ inputs.expected-fingerprint }}"
+
+      # GitHub Pages' official deploy action wants the files wrapped in its own
+      # artifact format (a tarball named "github-pages"). This only RE-PACKAGES
+      # the identical files; nothing is rebuilt.
+      - name: Package artifact for GitHub Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/
+          include-hidden-files: true
+
+      - name: Deploy to GitHub Pages (Production)
+        id: deploy
+        uses: actions/deploy-pages@v5
+
+      - name: Record failed deployment
+        if: failure()
+        run: scripts/release-status.sh set "$RELEASE_SHA" error "Production deployment FAILED - see workflow run"
+
+  smoke-test:
+    name: Production Smoke Test
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROD_URL: ${{ needs.deploy.outputs.url }}
+      RELEASE_SHA: ${{ inputs.release-sha }}
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release-sha }}
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+
+      - name: Wait for Production to serve this release
+        run: scripts/wait-for-release.sh "$PROD_URL" "$RELEASE_SHA" 600
+
+      - name: Health check (expect HTTP 200)
+        run: scripts/health-check.sh "$PROD_URL"
+
+      - name: Verify Production has the same fingerprint as Development
+        run: |
+          served=$(curl -sS "${PROD_URL}release.json?nocache=$(date +%s%N)" | jq -r .fingerprint)
+          echo "expected: ${{ inputs.expected-fingerprint }}"
+          echo "served:   $served"
+          test "$served" = "${{ inputs.expected-fingerprint }}"
+
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      # Small, safe test only: page loads, heading exists, one todo can be
+      # added (todos live in browser memory, so no real data is touched).
+      - name: Run Playwright smoke test against Production
+        run: npm run test:e2e:smoke
+        env:
+          BASE_URL: ${{ env.PROD_URL }}
+          EXPECTED_SHA: ${{ inputs.release-sha }}
+          EXPECTED_ENVIRONMENT: Production
+
+      - name: Mark release as live
+        run: |
+          scripts/release-status.sh set "$RELEASE_SHA" success "Live in Production (smoke test passed)"
+          echo "## ✅ Successful release — live at ${PROD_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      # This project does not roll back automatically (see README). We make the
+      # failure impossible to miss instead.
+      - name: Report failed Production smoke test
+        if: failure()
+        run: |
+          scripts/release-status.sh set "$RELEASE_SHA" error "Production smoke test FAILED - investigate now"
+          echo "::error title=Production smoke test failed::Release ${RELEASE_SHA::7} is deployed to Production but failed its smoke test."
+          {
+            echo "## ❌ Production smoke test FAILED"
+            echo "The release is deployed but did not pass its smoke test."
+            echo "To roll back: revert the bad commit on main (a new PR) or re-run the Deploy job of the last good release."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-production
+          path: playwright-report/
+          retention-days: 7

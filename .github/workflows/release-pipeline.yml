@@ -1,0 +1,315 @@
+# =============================================================================
+# RELEASE PIPELINE  (Phases 3 – 6)
+# =============================================================================
+# Triggered when code lands on main (i.e. when a Pull Request is merged).
+#
+#   CI checks again on main
+#        ↓
+#   Build ONE artifact (react-build-artifact)
+#        ↓
+#   Deploy Development  ->  Test Development (health check + Playwright)
+#        ↓
+#   Development Soak (1 hour)
+#        ├── someone runs "Promote Development to Production NOW" -> Production
+#        ├── someone runs "Abort Development Release"             -> STOP
+#        └── nobody does anything -> health check -> Deploy Production
+#                                                  -> Production Smoke Test
+#
+#               Build
+#                 ↓
+#           Build Artifact
+#              /     \
+#             ↓       ↓
+#           DEV  →  PROD      (the SAME files — never rebuilt)
+# =============================================================================
+name: Release Pipeline
+
+on:
+  push:
+    branches: [main]
+
+# Least privilege: by default every job gets NO permissions at all.
+# Each job below asks only for the specific permissions it needs.
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PHASE 3 — Re-run all CI checks on main.
+  # The PR was green, but main may now contain OTHER merged PRs too. We verify
+  # the actual code on main before deploying it. This also produces the single
+  # build artifact used by every environment below.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI on main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-checks.yml
+
+  # ---------------------------------------------------------------------------
+  # PHASE 4 — Deploy the artifact to the Development GitHub Pages site.
+  #
+  # The Development site lives in a SECOND repository (cicd-demo-dev) because
+  # one GitHub repository can only host one GitHub Pages site. The built-in
+  # GITHUB_TOKEN can only write to THIS repository, so pushing to the other
+  # repository requires a fine-grained Personal Access Token stored as the
+  # DEV_PAGES_DEPLOY_TOKEN secret in the "development" environment.
+  # ---------------------------------------------------------------------------
+  deploy-development:
+    name: Deploy Development
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Using a GitHub Environment gives us: environment-scoped secrets/variables,
+    # a deployment history under "Deployments", and a clickable URL in the
+    # workflow graph.
+    environment:
+      name: development
+      url: ${{ steps.target.outputs.url }}
+    # Never let two runs push to the Development site at the same time.
+    concurrency:
+      group: deploy-development
+      cancel-in-progress: false
+    outputs:
+      url: ${{ steps.target.outputs.url }}
+    steps:
+      - name: Checkout repository (for helper scripts)
+        uses: actions/checkout@v7
+
+      # Environment variables (Settings → Environments → development) can
+      # override these. Defaults follow the naming used in the README.
+      - name: Resolve Development target
+        id: target
+        env:
+          APP_URL: ${{ vars.APP_URL || format('https://{0}.github.io/cicd-demo-dev/', github.repository_owner) }}
+          PAGES_REPO: ${{ vars.PAGES_REPO || format('{0}/cicd-demo-dev', github.repository_owner) }}
+        run: |
+          echo "url=${APP_URL%/}/" >> "$GITHUB_OUTPUT"
+          echo "repo=$PAGES_REPO" >> "$GITHUB_OUTPUT"
+          echo "Deploying to repo $PAGES_REPO -> ${APP_URL%/}/"
+
+      # Retrieve the SAME artifact that was built and E2E-tested above.
+      - name: Download the build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: react-build-artifact
+          path: site
+
+      - name: Verify artifact fingerprint (proves nothing was rebuilt)
+        run: |
+          actual=$(scripts/fingerprint.sh site)
+          expected="${{ needs.ci.outputs.fingerprint }}"
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          test "$actual" = "$expected"
+
+      # Publish = force-push the artifact's files to the gh-pages branch of the
+      # cicd-demo-dev repository. GitHub Pages then serves that branch.
+      # The token is passed through an env var (never printed; GitHub also
+      # masks secrets in logs automatically).
+      - name: Publish to the Development GitHub Pages repository
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEV_PAGES_DEPLOY_TOKEN }}
+          PAGES_REPO: ${{ steps.target.outputs.repo }}
+        run: |
+          if [ -z "$DEPLOY_TOKEN" ]; then
+            echo "::error title=Missing secret::DEV_PAGES_DEPLOY_TOKEN is not set in the 'development' environment. See README → Setup → step 6."
+            exit 1
+          fi
+          cd site
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Deploy ${GITHUB_SHA::7} from ${GITHUB_REPOSITORY} run #${GITHUB_RUN_NUMBER}"
+          git push --force -q "https://x-access-token:${DEPLOY_TOKEN}@github.com/${PAGES_REPO}.git" gh-pages
+          echo "Pushed build to ${PAGES_REPO}@gh-pages"
+
+      # GitHub Pages needs ~30-90s to publish. Wait until the live site reports
+      # THIS commit in /release.json before we test it.
+      - name: Wait for Development to serve this release
+        run: scripts/wait-for-release.sh "${{ steps.target.outputs.url }}" "$GITHUB_SHA" 600
+
+  # ---------------------------------------------------------------------------
+  # PHASE 4 (cont.) — Test the REAL deployed Development site.
+  # If the health check or Playwright fails, this job fails and every later
+  # job (soak, production) is skipped: the pipeline STOPS.
+  # ---------------------------------------------------------------------------
+  test-development:
+    name: Test Development
+    needs: deploy-development
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DEV_URL: ${{ needs.deploy-development.outputs.url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up project
+        uses: ./.github/actions/setup-project
+
+      - name: Health check (expect HTTP 200)
+        run: scripts/health-check.sh "$DEV_URL"
+
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      # BASE_URL tells playwright.config.ts to skip the local server and test
+      # the live site instead. EXPECTED_SHA / EXPECTED_ENVIRONMENT make the
+      # tests verify they are looking at this exact release on the dev site.
+      - name: Run Playwright against the deployed Development site
+        run: npm run test:e2e
+        env:
+          BASE_URL: ${{ env.DEV_URL }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_ENVIRONMENT: Development
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-development
+          path: playwright-report/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # PHASE 5 — Development Soak window (default 60 minutes).
+  #
+  # The release sits in Development so humans can try it. Each minute this job
+  # checks the "release-control" commit status to see whether someone ran:
+  #   • "🚀 Promote Development to Production NOW"  -> stop waiting (done early)
+  #   • "🛑 Abort Development Release"               -> stop, no production
+  # If nobody acts, the timer expires and we promote automatically.
+  #
+  # Tip: set the repository variable SOAK_MINUTES (e.g. 5) while learning.
+  # ---------------------------------------------------------------------------
+  soak:
+    name: Development Soak
+    needs: [deploy-development, test-development]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      statuses: write # read/write the "release-control" commit status
+    outputs:
+      decision: ${{ steps.soak.outputs.decision }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEV_URL: ${{ needs.deploy-development.outputs.url }}
+      SOAK_MINUTES: ${{ vars.SOAK_MINUTES || '60' }}
+    steps:
+      - name: Checkout repository (for helper scripts)
+        uses: actions/checkout@v7
+
+      - name: Start the soak window
+        run: |
+          current=$(scripts/release-status.sh get "$GITHUB_SHA")
+          # Someone may have aborted while Development tests were running.
+          # Only mark "soaking" if nobody has decided anything yet.
+          if [ "$current" = "none" ]; then
+            ends_at=$(date -u -d "+${SOAK_MINUTES} minutes" +%H:%M)
+            scripts/release-status.sh set "$GITHUB_SHA" pending "Soaking in Development until ${ends_at} UTC, then auto-promote"
+          fi
+          {
+            echo "## ⏳ Development soak started (${SOAK_MINUTES} minutes)"
+            echo ""
+            echo "Test it now: **${DEV_URL}**"
+            echo ""
+            echo "| If you want to… | Run this workflow (Actions tab) |"
+            echo "|---|---|"
+            echo "| Ship it now | 🚀 Promote Development to Production NOW |"
+            echo "| Stop this release | 🛑 Abort Development Release |"
+            echo "| Let it ship automatically | Do nothing |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait, watching for Promote / Abort
+        id: soak
+        run: |
+          deadline=$(( $(date +%s) + SOAK_MINUTES * 60 ))
+          decision=promote
+
+          while true; do
+            state=$(scripts/release-status.sh get "$GITHUB_SHA")
+            case "$state" in
+              failure) decision=aborted ;;
+              success|error) decision=promoted-early ;;
+            esac
+            [ "$decision" != "promote" ] && break
+
+            # A newer merge may have replaced this release on Development.
+            # Never promote something that is no longer what people are testing.
+            served=$(curl -sS --max-time 20 "${DEV_URL}release.json?nocache=$(date +%s%N)" | jq -r '.sha // empty' || true)
+            if [ -n "$served" ] && [ "$served" != "$GITHUB_SHA" ]; then
+              decision=superseded
+              scripts/release-status.sh set "$GITHUB_SHA" failure "Superseded by newer release ${served:0:7} on Development"
+              break
+            fi
+
+            remaining=$(( deadline - $(date +%s) ))
+            [ "$remaining" -le 0 ] && break
+            echo "⏳ $(( (remaining + 59) / 60 )) min left in soak. Development: ${DEV_URL}  (state: ${state})"
+            sleep $(( remaining < 60 ? remaining : 60 ))
+          done
+
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "Soak finished. Decision: $decision"
+          case "$decision" in
+            promote)        msg="⏰ Soak window ended with no action → automatic promotion" ;;
+            aborted)        msg="🛑 Release was ABORTED: $(scripts/release-status.sh describe "$GITHUB_SHA")" ;;
+            promoted-early) msg="🚀 Release was already promoted EARLY (manually) → nothing left to do" ;;
+            superseded)     msg="↪️ A newer release replaced this one on Development → this one will not be promoted" ;;
+          esac
+          echo "::notice title=Soak result::$msg"
+          echo "## $msg" >> "$GITHUB_STEP_SUMMARY"
+
+      # OPTION 1 safety checks before automatic promotion: Development must
+      # still be healthy AND still be serving this exact release.
+      - name: Final Development health check before promotion
+        if: steps.soak.outputs.decision == 'promote'
+        run: |
+          scripts/health-check.sh "$DEV_URL"
+          scripts/wait-for-release.sh "$DEV_URL" "$GITHUB_SHA" 60
+
+  # ---------------------------------------------------------------------------
+  # OPTION 3 outcome — make an intentional abort obvious in the workflow graph.
+  # This job only appears as "run" when the release was aborted. It is green
+  # on purpose: an abort is a deliberate decision, not a failure.
+  # ---------------------------------------------------------------------------
+  release-aborted:
+    name: Release Aborted (Production skipped)
+    needs: soak
+    if: needs.soak.outputs.decision == 'aborted'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain what happened
+        run: |
+          echo "::warning title=Release intentionally aborted::A developer aborted this release during the soak window. Production was NOT changed."
+          {
+            echo "## 🛑 Release intentionally aborted"
+            echo "A developer ran **Abort Development Release** during the soak window."
+            echo "Production was **not** changed. Fix the problem in a new Pull Request."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # OPTION 1 — Automatic promotion after the soak window.
+  # PHASE 6 lives in deploy-production.yml, shared with the "Promote NOW"
+  # workflow so both paths deploy in exactly the same way.
+  # ---------------------------------------------------------------------------
+  production:
+    name: Production
+    needs: [ci, soak]
+    if: needs.soak.outputs.decision == 'promote'
+    permissions:
+      contents: read
+      actions: read # download the artifact
+      pages: write # deploy to GitHub Pages
+      id-token: write # prove to GitHub Pages that this deployment came from this workflow
+      statuses: write # update the release-control status
+    uses: ./.github/workflows/deploy-production.yml
+    with:
+      artifact-run-id: ${{ github.run_id }}
+      release-sha: ${{ github.sha }}
+      expected-fingerprint: ${{ needs.ci.outputs.fingerprint }}
+      promotion-type: automatic
