@@ -51,25 +51,29 @@ deployment_url="$(npx --yes "vercel@${cli_version}" deploy --prebuilt --prod --y
 echo "Vercel deployment: ${deployment_url}" >&2
 
 # 3. Find the stable public URL. Each deployment gets its own unique URL
-#    (e.g. cicd-demo-dev-8f3k2.vercel.app), which Vercel protects by default.
-#    The stable production domain (e.g. cicd-demo-dev.vercel.app) is public and
-#    always points at the newest production deployment — that's what we test.
+#    (e.g. cicd-demo-dev-8f3k2-team.vercel.app), and Vercel protects those
+#    behind a login by default. The project's PRODUCTION DOMAIN (the one listed
+#    under Domains in the Vercel dashboard, e.g. cicd-demo-dev.vercel.app) is
+#    public and always points at the newest production deployment. We ask
+#    Vercel's API for exactly that list.
 if [ -n "${APP_URL:-}" ]; then
   public_url="${APP_URL%/}/"
 else
-  query=""
-  if [[ "$VERCEL_ORG_ID" == team_* ]]; then query="?teamId=${VERCEL_ORG_ID}"; fi
-  aliases="$(curl -fsS -H "Authorization: Bearer ${VERCEL_TOKEN}" \
-    "https://api.vercel.com/v13/deployments/${deployment_url#https://}${query}" |
-    jq -r '.alias // [] | .[]')"
-  echo "Domains assigned to this deployment:" >&2
-  echo "${aliases:-  (none)}" >&2
-  shortest="$(echo "$aliases" | awk 'NF { print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
-  if [ -z "$shortest" ]; then
-    echo "::error title=No public domain::Vercel assigned no domain. Set the APP_URL variable for this environment (README → Setup → step 4)." >&2
+  team_query=""
+  if [[ "$VERCEL_ORG_ID" == team_* ]]; then team_query="&teamId=${VERCEL_ORG_ID}"; fi
+  domains="$(curl -fsS -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+    "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/domains?production=true&redirects=false${team_query}" |
+    jq -r '.domains[] | select(.gitBranch == null) | .name')"
+  echo "Production domains of this Vercel project:" >&2
+  echo "${domains:-  (none)}" >&2
+  # Prefer a *.vercel.app domain; if you add a custom domain later, set APP_URL.
+  domain="$(echo "$domains" | grep -E '\.vercel\.app$' | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2- || true)"
+  domain="${domain:-$(echo "$domains" | head -1)}"
+  if [ -z "$domain" ]; then
+    echo "::error title=No public domain::The Vercel project has no production domain. Set the APP_URL variable for this environment (README → Setup → step 4)." >&2
     exit 1
   fi
-  public_url="https://${shortest}/"
+  public_url="https://${domain}/"
 fi
 
 echo "Public URL: ${public_url}" >&2

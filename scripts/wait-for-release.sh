@@ -13,8 +13,11 @@ timeout="${3:-600}"
 deadline=$(($(date +%s) + timeout))
 
 while true; do
-  served_sha=$(curl -sS --max-time 20 -H 'Cache-Control: no-cache' \
-    "${url}release.json?nocache=$(date +%s%N)" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null || true)
+  body_file="$(mktemp)"
+  status=$(curl -sS --max-time 20 -H 'Cache-Control: no-cache' -o "$body_file" -w '%{http_code}' \
+    "${url}release.json?nocache=$(date +%s%N)" 2>/dev/null || echo "000")
+  served_sha=$(jq -r '.sha // empty' "$body_file" 2>/dev/null || true)
+  rm -f "$body_file"
 
   if [ "$served_sha" = "$expected_sha" ]; then
     echo "✅ ${url} is serving release ${expected_sha:0:7}"
@@ -22,10 +25,14 @@ while true; do
   fi
 
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "❌ Timed out after ${timeout}s. Expected ${expected_sha:0:7}, site is serving '${served_sha:-nothing}'"
+    echo "❌ Timed out after ${timeout}s. Expected ${expected_sha:0:7}, site is serving '${served_sha:-nothing}' (last HTTP status: ${status})"
+    if [ "$status" = "401" ] || [ "$status" = "403" ]; then
+      echo "   HTTP ${status} means the URL is behind Vercel's login (Deployment Protection)."
+      echo "   Use the project's public production domain, or set APP_URL for this environment."
+    fi
     exit 1
   fi
 
-  echo "⏳ Waiting for ${url} to serve ${expected_sha:0:7} (currently '${served_sha:-nothing yet}')..."
+  echo "⏳ Waiting for ${url} to serve ${expected_sha:0:7} (currently '${served_sha:-nothing yet}', HTTP ${status})..."
   sleep 15
 done
